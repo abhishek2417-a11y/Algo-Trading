@@ -1,0 +1,31 @@
+# Requirements for algo-trading project
+
+# Core dependencies - simplified for testing
+numpy
+pandas
+matplotlib
+
+# Data analysis and visualization
+pytz>=2023.3
+python-dateutil>=2.8.2
+
+# API and networking
+requests>=2.31.0
+websocket-client>=1.8.0
+simplejson>=3.19.1
+
+# Logging
+logzero>=1.7.0
+
+# Authentication and security
+pyotp>=2.8.0
+
+# Simplified dependencies for testing
+attrs>=23.1.0
+certifi>=2023.5.7
+charset-normalizer>=3.1.0
+idna>=3.4
+pyparsing>=3.1.0
+six>=1.16.0
+typing_extensions>=4.6.3
+urllib3>=2.0.3

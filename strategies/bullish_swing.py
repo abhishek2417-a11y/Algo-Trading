@@ -10,6 +10,7 @@ from datetime import datetime
 
 from ..utils.logger import logger
 from ..models.option import OptionData
+from ..models.order_manager import OrderManager
 from ..config import settings
 
 class BullishSwingStrategy:
@@ -19,17 +20,17 @@ class BullishSwingStrategy:
     and generates trading signals when price breaks above the D point.
     """
     
-    def __init__(self, data, broker=None):
+    def __init__(self, data, order_manager=None):
         """
-        Initialize the strategy with price data and broker connection.
+        Initialize the strategy with price data and order manager.
         
         Args:
             data (pd.DataFrame): Price data with OHLCV columns
-            broker: Broker instance for placing orders
+            order_manager: OrderManager instance for handling orders
         """
-        # Store the data and broker connection
+        # Store the data and order manager
         self.data = data.copy() if not data.empty else pd.DataFrame()
-        self.broker = broker
+        self.order_manager = order_manager
         
         # Initialize signal tracking
         self.signals = pd.DataFrame(index=self.data.index) if not self.data.empty else pd.DataFrame()
@@ -59,10 +60,10 @@ class BullishSwingStrategy:
         self.structures = []
         self.executed_patterns = []
         self.options_data = None
-        self.last_order_id = None
-        self.order_history = []
-        self.order_counter = 0
         self.signal_counter = 0
+        
+        # Initialize order manager
+        self.order_manager = OrderManager(broker) if broker else None
         
         # Greeks data caching
         self.last_greeks_refresh = None
@@ -117,10 +118,22 @@ class BullishSwingStrategy:
             logger.info(f"Stop Loss: {self.pending_setup['stop_loss']:.2f}")
             logger.info(f"Target: {self.pending_setup['target']:.2f}")
             
-            risk = self.pending_setup['entry_price'] - self.pending_setup['stop_loss']
+            # Display enhanced risk management information
+            risk = self.pending_setup.get('risk_per_unit', self.pending_setup['entry_price'] - self.pending_setup['stop_loss'])
             reward = self.pending_setup['target'] - self.pending_setup['entry_price']
-            risk_reward = reward / risk if risk > 0 else 0
+            risk_reward = self.pending_setup.get('risk_reward_ratio', reward / risk if risk > 0 else 0)
+            
             logger.info(f"Risk:Reward - 1:{risk_reward:.2f}")
+            logger.info(f"Position Size: {self.pending_setup.get('position_size', settings.DEFAULT_LOT_SIZE)} units")
+            logger.info(f"Max Risk Amount: {self.pending_setup.get('max_risk_amount', 0):.2f}")
+            
+            # Calculate and display total risk for the trade
+            total_risk = risk * self.pending_setup.get('position_size', settings.DEFAULT_LOT_SIZE)
+            logger.info(f"Total Risk: {total_risk:.2f}")
+            
+            # Display volatility information
+            volatility_factor = self._calculate_volatility_factor()
+            logger.info(f"Market Volatility Factor: {volatility_factor:.2f}")
             
         logger.info("====================================\n")
     
@@ -148,17 +161,38 @@ class BullishSwingStrategy:
             d_time = self.data.index[self.D_idx]
             
             logger.info(f"POINT CALCULATION: D calculated at price {self.D:.2f} at time {d_time}")
+            logger.info("\n===== COMPLETE STRUCTURE DETAILS =====")
+            logger.info(f"L1: {self.L1:.2f} at {self.data.index[self.L1_idx]}")
+            logger.info(f"H1: {self.H1:.2f} at {self.data.index[self.H1_idx]}")
+            logger.info(f"A: {self.A:.2f} at {self.data.index[self.A_idx]}")
+            logger.info(f"B: {self.B:.2f} (swing low) at {self.data.index[self.B_idx]}")
+            logger.info(f"C: {self.C:.2f} at {self.data.index[self.C_idx]}")
+            logger.info(f"D: {self.D:.2f} at {self.data.index[self.D_idx]}")
+            logger.info("======================================\n")
             
-            # Calculate trade parameters
+            # Calculate trade parameters with enhanced risk management
             entry_price = self.D + 0.05  # Small buffer above D
             stop_loss = self.C - 0.05  # Below C point for stop loss
             risk = entry_price - stop_loss
-            target = entry_price + (risk * 2)  # 1:2 Risk-Reward
+            
+            # Dynamic risk-reward ratio based on market conditions
+            # Use higher RR when market is trending strongly, lower when choppy
+            volatility_factor = self._calculate_volatility_factor()
+            risk_reward_ratio = max(2.0, 2.0 + volatility_factor)  # Minimum 1:2, can increase based on volatility
+            target = entry_price + (risk * risk_reward_ratio)
+            
+            # Calculate position size based on risk parameters
+            max_risk_amount = self._calculate_max_risk_amount()
+            position_size = self._calculate_position_size(risk, max_risk_amount)
             
             self.pending_setup = {
                 'entry_price': entry_price,
                 'stop_loss': stop_loss,
                 'target': target,
+                'risk_reward_ratio': risk_reward_ratio,
+                'position_size': position_size,
+                'max_risk_amount': max_risk_amount,
+                'risk_per_unit': risk,
                 'structure': {
                     'H1': (self.H1_idx, self.H1),
                     'L1': (self.L1_idx, self.L1),
@@ -173,7 +207,8 @@ class BullishSwingStrategy:
             
             # Fetch options data if broker is available
             if self.broker and hasattr(self.broker, 'api'):
-                self.refresh_option_greeks(force_refresh=True)
+                logger.info("Fetching option Greeks for CE buying setup...")
+                self.refresh_option_greeks(current_idx=self.D_idx, force_refresh=True)
     
     def is_swing_high(self, idx):
         """
@@ -266,51 +301,306 @@ class BullishSwingStrategy:
                 self.D_idx = None
                 self.pending_setup = None
     
-    def refresh_option_greeks(self, current_idx=None, force_refresh=False):
+    def refresh_option_greeks(self, current_idx=None, force_refresh=False, min_refresh_interval=600, display_mapping=True):
         """
-        Fetch and refresh option Greeks data.
+        Refresh option Greeks data and select appropriate options for trading.
         
         Args:
-            current_idx (int, optional): Index in data for timestamp reference
-            force_refresh (bool): Force refresh regardless of time check
+            current_idx (int, optional): Current index in the data
+            force_refresh (bool): Force refresh regardless of time interval
+            min_refresh_interval (int): Minimum time between refreshes in seconds
+            display_mapping (bool): Whether to display option mapping details
             
         Returns:
-            bool: True if successful or using cached data, False if failed
+            bool: True if refresh was successful, False otherwise
         """
+        current_time = time.time()
+        
+        # Check if we need to refresh based on time interval
+        if not force_refresh and self.last_greeks_refresh and \
+           (current_time - self.last_greeks_refresh) < min_refresh_interval:
+            logger.info(f"Skipping Greeks refresh - last refresh was {current_time - self.last_greeks_refresh:.1f}s ago")
+            return False
+            
         if not self.broker or not hasattr(self.broker, 'api'):
-            logger.warning("Broker not available for fetching option Greeks")
+            logger.warning("No broker API available for fetching option data")
             return False
             
         try:
-            current_time = datetime.now()
+            # Use current index if provided, otherwise use the latest data point
+            if current_idx is None:
+                current_idx = len(self.data) - 1
+                
+            current_price = self.data.iloc[current_idx]['close']
+            logger.info(f"Fetching option Greeks at price {current_price:.2f}")
             
-            # Check if we've refreshed recently
-            if hasattr(self, 'last_greeks_refresh') and self.last_greeks_refresh and not force_refresh:
-                elapsed = (current_time - self.last_greeks_refresh).total_seconds()
-                if elapsed < self.greeks_refresh_interval:
-                    logger.debug(f"Using cached Greeks ({elapsed:.1f}s old)")
-                    return True
-                    
-            # Get nearest expiry dates
-            # This would typically involve calling a function to get expiry dates
-            # For simplicity, we'll assume we have a function called get_nearest_expiry_dates
+            # This would be implemented in the broker to fetch options data
+            # For now, we'll simulate it with a placeholder
+            options_data = self._fetch_options_data(current_price)
             
-            # Get option Greeks from broker API
-            # For simplicity, we'll just note that this would call the broker's API
-            
-            # For now, we'll simulate this with a placeholder
-            self.cached_options_data = pd.DataFrame()  # This would be real data in practice
+            if options_data is None or options_data.empty:
+                logger.warning("Failed to fetch options data")
+                return False
+                
+            self.options_data = options_data
             self.last_greeks_refresh = current_time
             
-            logger.info(f"Successfully refreshed Greeks")
+            # Process the options data for CE buying strategy
+            self._process_options_for_strategy(current_price, display_mapping)
+            
             return True
             
         except Exception as e:
-            logger.error(f"Error refreshing Greeks: {e}")
-            if hasattr(self, 'cached_options_data') and self.cached_options_data is not None:
-                logger.warning("Continuing with previously fetched options data")
-                return True
+            logger.error(f"Error refreshing option Greeks: {e}")
             return False
+            
+    def _fetch_options_data(self, current_price):
+        """
+        Fetch options data from the broker.
+        This is a placeholder that would be implemented with actual broker API calls.
+        
+        Args:
+            current_price (float): Current underlying price
+            
+        Returns:
+            pd.DataFrame: Options data or None if failed
+        """
+        try:
+            # This would be implemented with actual broker API calls
+            # For now, return cached data if available
+            if self.cached_options_data is not None:
+                return self.cached_options_data
+                
+            # Placeholder for actual implementation
+            logger.info("This is a placeholder for actual options data fetching")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error fetching options data: {e}")
+            return None
+            
+    def _calculate_volatility_factor(self):
+        """
+        Calculate a volatility factor based on recent price action.
+        Higher volatility may warrant higher risk-reward ratios.
+        
+        Returns:
+            float: Volatility factor (0.0 to 1.0)
+        """
+        try:
+            # Use the last 20 candles to calculate volatility
+            lookback = min(20, len(self.data) - 1)
+            if lookback <= 0:
+                return 0.0
+                
+            # Calculate the average true range (ATR) as a volatility measure
+            high_low = self.data['high'][-lookback:] - self.data['low'][-lookback:]
+            high_close = abs(self.data['high'][-lookback:] - self.data['close'][-lookback-1:-1].values)
+            low_close = abs(self.data['low'][-lookback:] - self.data['close'][-lookback-1:-1].values)
+            
+            ranges = pd.concat([high_low, high_close, low_close], axis=1)
+            true_range = ranges.max(axis=1)
+            atr = true_range.mean()
+            
+            # Calculate the average price over the same period
+            avg_price = self.data['close'][-lookback:].mean()
+            
+            # Normalize ATR as a percentage of average price
+            normalized_atr = atr / avg_price if avg_price > 0 else 0
+            
+            # Map normalized ATR to a volatility factor (0.0 to 1.0)
+            # Higher ATR = higher volatility = higher factor
+            volatility_factor = min(1.0, normalized_atr * 100)  # Scale appropriately
+            
+            logger.info(f"Calculated volatility factor: {volatility_factor:.2f} (ATR: {atr:.2f}, Avg Price: {avg_price:.2f})")
+            return volatility_factor
+            
+        except Exception as e:
+            logger.error(f"Error calculating volatility factor: {e}")
+            return 0.0
+    
+    def _calculate_max_risk_amount(self):
+        """
+        Calculate the maximum risk amount for this trade based on account settings.
+        
+        Returns:
+            float: Maximum risk amount in currency units
+        """
+        try:
+            # Get account balance from broker if available
+            account_balance = 0
+            if self.broker and hasattr(self.broker, 'get_account_balance'):
+                account_balance = self.broker.get_account_balance()
+            else:
+                # Use default value from settings if broker not available
+                account_balance = settings.DEFAULT_ACCOUNT_BALANCE
+            
+            # Calculate risk based on risk percentage from settings
+            risk_percentage = settings.TARGET_RISK_MID / 100.0  # Convert percentage to decimal
+            max_risk = account_balance * risk_percentage
+            
+            # Apply additional risk adjustments based on market conditions
+            # For example, reduce risk in high volatility environments
+            volatility_factor = self._calculate_volatility_factor()
+            if volatility_factor > 0.5:  # High volatility
+                max_risk *= (1.0 - (volatility_factor - 0.5))  # Reduce risk as volatility increases
+            
+            logger.info(f"Maximum risk amount: {max_risk:.2f} (Account: {account_balance:.2f}, Risk %: {risk_percentage:.2%})")
+            return max_risk
+            
+        except Exception as e:
+            logger.error(f"Error calculating max risk amount: {e}")
+            return settings.DEFAULT_MAX_RISK
+    
+    def _calculate_position_size(self, risk_per_unit, max_risk_amount):
+        """
+        Calculate the appropriate position size based on risk parameters.
+        
+        Args:
+            risk_per_unit (float): Risk per unit (entry price - stop loss)
+            max_risk_amount (float): Maximum risk amount in currency units
+            
+        Returns:
+            int: Position size in number of units/lots
+        """
+        try:
+            if risk_per_unit <= 0:
+                logger.warning("Invalid risk per unit (must be > 0)")
+                return settings.DEFAULT_LOT_SIZE
+                
+            # Calculate raw position size based on risk
+            raw_position_size = max_risk_amount / risk_per_unit
+            
+            # Round down to nearest lot size
+            lot_size = settings.DEFAULT_LOT_SIZE
+            position_size = int(raw_position_size / lot_size) * lot_size
+            
+            # Ensure position size is within limits
+            min_position = settings.MIN_POSITION_SIZE if hasattr(settings, 'MIN_POSITION_SIZE') else lot_size
+            max_position = settings.MAX_POSITION_SIZE if hasattr(settings, 'MAX_POSITION_SIZE') else lot_size * 10
+            
+            position_size = max(min_position, min(position_size, max_position))
+            
+            logger.info(f"Calculated position size: {position_size} units (Risk/Unit: {risk_per_unit:.2f}, Max Risk: {max_risk_amount:.2f})")
+            return position_size
+            
+        except Exception as e:
+            logger.error(f"Error calculating position size: {e}")
+            return settings.DEFAULT_LOT_SIZE
+    
+    def _process_options_for_strategy(self, current_price, display_mapping=True):
+        """
+        Process options data for the current strategy.
+        Selects appropriate options based on strategy type and current price.
+        
+        Args:
+            current_price (float): Current underlying price
+            display_mapping (bool): Whether to display option mapping details
+        """
+        if self.options_data is None or self.options_data.empty:
+            logger.warning("No options data available for processing")
+            return
+            
+        try:
+            # Filter for CE options for bullish strategy
+            ce_options = self.options_data[self.options_data['option_type'] == 'CE'].copy()
+            if ce_options.empty:
+                logger.warning("No CE options found in options data")
+                return
+                
+            # Get unique expiry dates and sort them
+            expiry_dates = sorted(ce_options['expiry_date'].unique())
+            if len(expiry_dates) < 2:
+                logger.warning(f"Insufficient expiry dates found: {len(expiry_dates)}")
+                return
+                
+            current_expiry = expiry_dates[0]
+            next_expiry = expiry_dates[1]
+            
+            logger.info(f"Processing options for current expiry: {current_expiry} and next expiry: {next_expiry}")
+            
+            # Process current expiry options
+            current_exp_options = ce_options[ce_options['expiry_date'] == current_expiry].copy()
+            current_exp_options['distance_from_price'] = abs(current_exp_options['strike_float'] - current_price)
+            current_exp_options = current_exp_options.sort_values('distance_from_price')
+            
+            # Find true ATM strike (closest strike below or equal to current price)
+            atm_options = current_exp_options[current_exp_options['strike_float'] <= current_price]
+            if not atm_options.empty:
+                atm_strike = atm_options.iloc[0]['strike_float']
+            else:
+                # If no strikes below current price, take the lowest OTM strike
+                atm_strike = current_exp_options.iloc[0]['strike_float']
+                
+            # Select strikes for current expiry
+            current_exp_selected = pd.DataFrame()
+            
+            # 1 nearest OTM (strictly greater than current price)
+            otm_options = current_exp_options[current_exp_options['strike_float'] > current_price].sort_values('strike_float')
+            if not otm_options.empty:
+                current_exp_selected = pd.concat([current_exp_selected, otm_options.head(1)])
+                
+            # 1 ATM
+            atm_option = current_exp_options[current_exp_options['strike_float'] == atm_strike]
+            if not atm_option.empty:
+                current_exp_selected = pd.concat([current_exp_selected, atm_option]).drop_duplicates()
+                
+            # 4 nearest ITM
+            itm_options = current_exp_options[current_exp_options['strike_float'] < current_price].sort_values('strike_float', ascending=False)
+            if not itm_options.empty:
+                current_exp_selected = pd.concat([current_exp_selected, itm_options.head(4)]).drop_duplicates()
+                
+            # Process next expiry options
+            next_exp_options = ce_options[ce_options['expiry_date'] == next_expiry].copy()
+            next_exp_options['distance_from_price'] = abs(next_exp_options['strike_float'] - current_price)
+            next_exp_options = next_exp_options.sort_values('distance_from_price')
+            
+            # Find true ATM strike for next expiry
+            next_atm_options = next_exp_options[next_exp_options['strike_float'] <= current_price]
+            if not next_atm_options.empty:
+                next_atm_strike = next_atm_options.iloc[0]['strike_float']
+            else:
+                next_atm_strike = next_exp_options.iloc[0]['strike_float']
+                
+            # Select strikes for next expiry
+            next_exp_selected = pd.DataFrame()
+            
+            # 1 nearest OTM
+            next_otm_options = next_exp_options[next_exp_options['strike_float'] > current_price].sort_values('strike_float')
+            if not next_otm_options.empty:
+                next_exp_selected = pd.concat([next_exp_selected, next_otm_options.head(1)]).drop_duplicates()
+                
+            # 1 ATM
+            next_atm_option = next_exp_options[next_exp_options['strike_float'] == next_atm_strike]
+            if not next_atm_option.empty:
+                next_exp_selected = pd.concat([next_exp_selected, next_atm_option]).drop_duplicates()
+                
+            # 3 nearest ITM
+            next_itm_options = next_exp_options[next_exp_options['strike_float'] < current_price].sort_values('strike_float', ascending=False)
+            if not next_itm_options.empty:
+                next_exp_selected = pd.concat([next_exp_selected, next_itm_options.head(3)]).drop_duplicates()
+                
+            # Combine selected options from both expiries
+            selected_options = pd.concat([current_exp_selected, next_exp_selected])
+            selected_options = selected_options.drop_duplicates()
+            
+            # Store the selected options for trading
+            if not selected_options.empty:
+                self.pending_setup['options_data'] = selected_options
+                logger.info(f"Selected {len(selected_options)} options for trading")
+                
+                if display_mapping:
+                    logger.info("\n===== SELECTED OPTIONS =====")
+                    for _, option in selected_options.iterrows():
+                        logger.info(f"Strike: {option['strike_float']}, Type: {option['option_type']}, "  
+                                   f"Expiry: {option['expiry_date']}, Delta: {option.get('delta', 'N/A')}")
+                    logger.info("============================\n")
+            else:
+                logger.warning("No suitable options selected for trading")
+                
+        except Exception as e:
+            logger.error(f"Error processing options for strategy: {e}")
+
     
     def calculate_option_stop_loss(self, option_data, underlying_entry, underlying_sl):
         """
@@ -426,107 +716,20 @@ class BullishSwingStrategy:
     
     def place_order(self, signal_data):
         """
-        Place an order based on signal data.
-        
+        Place an order based on signal data using the OrderManager.
+
         Args:
             signal_data (dict): Signal data with order parameters
-            
+
         Returns:
             str: Order ID if successful, None otherwise
         """
-        if not self.broker:
-            logger.error("Broker not available for placing order")
+        if not self.order_manager:
+            logger.error("OrderManager not available for placing order")
             return None
-            
-        if not signal_data or 'option_data' not in signal_data:
-            logger.error("Invalid signal data for order placement")
-            return None
-            
-        # Extract order details
-        option_data = signal_data['option_data']
-        quantity = signal_data['quantity']
-        entry_price = signal_data['entry_price']
-        stop_loss = signal_data['stop_loss']
-        target = signal_data['target']
-        
-        # Prepare order parameters for bracket order
-        order_params = {
-            "tradingsymbol": option_data['symbol'],
-            "symboltoken": option_data['token'],
-            "transactiontype": "BUY",
-            "exchange": "NFO",
-            "ordertype": "MARKET",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "quantity": str(quantity),
-            "squareoff": str(round(option_data['target'] - option_data['last_price'], 2)),
-            "stoploss": str(round(option_data['last_price'] - option_data['stop_loss'], 2))
-        }
-        
-        # Place bracket order
-        order_id = self.broker.place_order(order_params, order_type="BO")
-        
-        if order_id:
-            # Increment order counter
-            self.order_counter += 1
-            
-            # Record order details
-            order_record = {
-                'order_id': order_id,
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'symbol': option_data['symbol'],
-                'token': option_data['token'],
-                'strike': option_data['strike'],
-                'option_type': option_data['option_type'],
-                'expiry': option_data['expiry'],
-                'quantity': quantity,
-                'entry_price': option_data['last_price'],
-                'stop_loss': option_data['stop_loss'],
-                'target': option_data['target'],
-                'status': 'PLACED',
-                'variety': 'BO'
-            }
-            
-            # Save order record
-            self._save_order_to_csv(order_record)
-            self.order_history.append(order_record)
-            self.last_order_id = order_id
-            
-            logger.info(f"Bracket order placed successfully with ID: {order_id}")
-            return order_id
-        else:
-            logger.error("Failed to place order")
-            return None
+
+        return self.order_manager.place_order(signal_data)
     
-    def _save_order_to_csv(self, order_data):
-        """
-        Save order data to a CSV file.
-        
-        Args:
-            order_data (dict): Order details
-        """
-        try:
-            # Generate filename with date
-            date_str = datetime.now().strftime("%Y%m%d")
-            filename = os.path.join(settings.ORDER_HISTORY_DIR, f'order_history_{date_str}.csv')
-            
-            # Convert complex objects to strings
-            for key, value in order_data.items():
-                if isinstance(value, (dict, list)):
-                    order_data[key] = str(value)
-                    
-            # Convert to DataFrame for easier CSV handling
-            df = pd.DataFrame([order_data])
-            
-            # Check if file exists to determine headers
-            file_exists = os.path.isfile(filename)
-            
-            # Write to CSV
-            df.to_csv(filename, mode='a', header=not file_exists, index=False)
-            logger.info(f"Saved order details to {filename}")
-            
-        except Exception as e:
-            logger.error(f"Error saving order to CSV: {e}")
     
     def generate_signals(self):
         """

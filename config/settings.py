@@ -6,11 +6,10 @@ import os
 from pathlib import Path
 
 
-API_KEY = ''
-USERNAME = ''
-PASSWORD = ''
-TOTP_KEY = ''
-
+API_KEY = 'zCjdRuaC '
+USERNAME = 'A1389496'
+PASSWORD = '2026'
+TOTP_KEY = 'EGT7K2YIJUMQFL3L4PPCEVYDDQ'
 
 SPOT_TOKEN = "99926000"
 

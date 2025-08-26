@@ -11,6 +11,7 @@ from .strategies.bullish_swing import BullishSwingStrategy
 from .data.ohlcv import LiveOHLCVData, fetch_historical_data
 from .utils.helpers import get_today_date_range, fetch_scripmaster_data, get_nearest_expiry_dates
 from .utils.logger import logger
+from .models.order_manager import OrderManager
 from .config import settings
 
 class AlgoTradingApp:
@@ -172,7 +173,8 @@ class AlgoTradingApp:
             
            
             spot_df = self.spot_5min.get_dataframe()
-            self.spot_strategy = BullishSwingStrategy(spot_df, self.broker)
+            order_manager = OrderManager(self.broker)
+            self.spot_strategy = BullishSwingStrategy(spot_df, order_manager)
             self.spot_strategy.generate_signals()
             
             logger.info("Initialized strategies with historical data")
